@@ -1,15 +1,18 @@
+import os
+import shutil
 import numpy as np
-import multiprocessing
-from tqdm.auto import tqdm
 from dipy.utils.optpkg import optional_package
+import json
+import tempfile
+import multiprocessing
 
+ray, has_ray, _ = optional_package('ray')
 joblib, has_joblib, _ = optional_package('joblib')
 dask, has_dask, _ = optional_package('dask')
-ray, has_ray, _ = optional_package('ray')
 
 
-def paramap(func, in_list, out_shape=None, n_jobs=-1, engine="joblib",
-            backend=None, func_args=None, func_kwargs=None,
+def paramap(func, in_list, out_shape=None, n_jobs=-1, engine="ray",
+            backend=None, func_args=None, clean_spill=True, func_kwargs=None,
             **kwargs):
     """
     Maps a function to a list of inputs in parallel.
@@ -32,17 +35,21 @@ def paramap(func, in_list, out_shape=None, n_jobs=-1, engine="joblib",
     engine : str
         {"dask", "joblib", "ray", "serial"}
         The last one is useful for debugging -- runs the code without any
-        parallelization. Default: "joblib"
+        parallelization. Default: "ray"
     backend : str, optional
         What joblib or dask backend to use. For joblib, the default is "loky".
         For dask the default is "threading".
+    clean_spill : bool, optional
+        If True, clean up the spill directory after the computation is done.
+        Only applies to "ray" engine. Otherwise has no effect.
+        Default: True.
     func_args : list, optional
         Positional arguments to `func`.
     func_kwargs : dict, optional
         Keyword arguments to `func`.
     kwargs : dict, optional
         Additional arguments to pass to either joblib.Parallel
-        or dask.compute depending on the engine used.
+        or dask.compute, or ray.remote depending on the engine used.
         Default: {}
 
     Returns
@@ -95,14 +102,30 @@ def paramap(func, in_list, out_shape=None, n_jobs=-1, engine="joblib",
         if not has_ray:
             raise ray()
 
-        func = ray.remote(func)
+        if clean_spill:
+            tmp_dir = tempfile.TemporaryDirectory()
+
+            if not ray.is_initialized():
+                ray.init(_system_config={
+                    "object_spilling_config": json.dumps(
+                        {"type": "filesystem", "params": {"directory_path":
+                         tmp_dir.name}},
+                    )
+                },)
+
+        func = ray.remote(func, **kwargs)
         results = ray.get([func.remote(ii, *func_args, **func_kwargs)
-                           for ii in in_list])
+                          for ii in in_list])
+
+        if clean_spill:
+            shutil.rmtree(tmp_dir.name)
 
     elif engine == "serial":
         results = []
         for in_element in in_list:
             results.append(func(in_element, *func_args, **func_kwargs))
+    else:
+        raise ValueError("%s is not a valid engine" % engine)
 
     if out_shape is not None:
         return np.array(results).reshape(out_shape)
