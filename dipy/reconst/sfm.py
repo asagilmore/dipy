@@ -35,6 +35,7 @@ import dipy.data as dpd
 from dipy.reconst.base import ReconstModel, ReconstFit
 from dipy.reconst.cache import Cache
 from dipy.core.onetime import auto_attr
+from dipy.reconst.multi_voxel import multi_voxel_fit
 
 joblib, has_joblib, _ = optional_package('joblib')
 sklearn, has_sklearn, _ = optional_package('sklearn')
@@ -459,6 +460,7 @@ class SparseFascicleModel(ReconstModel, Cache):
                 return np.zeros(self.design_matrix.shape[-1])
         return coef
 
+    @multi_voxel_fit
     def fit(self, data, mask=None, num_processes=1,
             parallel_backend='multiprocessing'):
         """
