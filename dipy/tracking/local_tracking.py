@@ -7,7 +7,9 @@ from dipy.tracking.localtrack import local_tracker, pft_tracker
 from dipy.tracking.stopping_criterion import (AnatomicalStoppingCriterion,
                                               StreamlineStatus)
 from dipy.tracking import utils
-from dipy.utils import fast_numpy
+from dipy.utils import fast_numpy, optional_package
+
+ray, has_ray, _ = optional_package('ray')
 
 
 class LocalTracking:
@@ -228,6 +230,184 @@ class LocalTracking:
                             yield streamline
 
 
+class ParaLocalTracking(LocalTracking):
+    """Creates streamlines by using local fiber-tracking. Computes streamlines
+    in batches in parallel using ray.
+
+    Parameters
+    ----------
+    direction_getter : instance of DirectionGetter
+        Used to get directions for fiber tracking.
+    stopping_criterion : instance of StoppingCriterion
+        Identifies endpoints and invalid points to inform tracking.
+    seeds : array (N, 3), optional
+        Points to seed the tracking. Seed points should be given in point
+        space of the track (see ``affine``).
+    affine : array (4, 4), optional
+        Coordinate space for the streamline point with respect to voxel
+        indices of input data. This affine can contain scaling, rotational,
+        and translational components but should not contain any shearing.
+        An identity matrix can be used to generate streamlines in "voxel
+        coordinates" as long as isotropic voxels were used to acquire the
+        data.
+    step_size : float, optional
+        Step size used for tracking.
+    max_cross : int or None, optional
+        The maximum number of direction to track from each seed in crossing
+        voxels. By default all initial directions are tracked.
+    maxlen : int, optional
+        Maximum length of generated streamlines. Longer streamlines will be
+        discarted if `return_all=False`.
+    minlen : int, optional
+        Minimum length of generated streamlines. Shorter streamlines will
+        be discarted if `return_all=False`.
+    fixedstep : bool, optional
+        If true, a fixed stepsize is used, otherwise a variable step size
+        is used.
+    return_all : bool, optional
+        If true, return all generated streamlines, otherwise only
+        streamlines reaching end points or exiting the image.
+    random_seed : int, optional
+        The seed for the random seed generator (numpy.random.seed and
+        random.seed).
+    save_seeds : bool, optional
+        If True, return seeds alongside streamlines
+    unidirectional : bool, optional
+        If true, the tracking is performed only in the forward direction.
+        The seed position will be the first point of all streamlines.
+    randomize_forward_direction : bool, optional
+        If true, the forward direction is randomized (multiplied by 1
+        or -1). Otherwise, the provided forward direction is used.
+    initial_directions: array (N, npeaks, 3), optional
+        Initial direction to follow from the ``seed`` position. If
+        ``max_cross`` is None, one streamline will be generated per peak
+        per voxel. If None, `direction_getter.initial_direction` is used.
+    """
+    def __init__(self, num_workers, buffer_size=1000, *args, **kwargs):
+        if not has_ray:
+            raise ray()
+        if kwargs.get('seeds', None) is not None:
+            raise ValueError("Parallel tracking does not support seeds"
+                             "currently")
+
+        self.num_workers = num_workers
+        self.buffer_size = buffer_size
+        self.curr_index = 0
+        self._streamlines = []
+        super().__init__(*args, **kwargs)
+
+    def __iter__(self):
+        # Make tracks, move them to point space and return
+        track = self._generate_tractogram()
+
+        return utils.transform_tracking_output(track, self.affine,
+                                               save_seeds=self.save_seeds)
+
+    def _generate_tractogram(self):
+        func = ray.remote(self._generate_streamline)
+        for index, _ in enumerate(self.seeds):
+            # if no streamlines left in buffer compute a new batch
+            if len(self._streamlines) == 0:
+                seeds_left = len(self.seeds) - index
+                if seeds_left < self.buffer_size:
+                    new_streamlines = ray.get([func.remote(i)
+                                              for i in range(self.curr_index,
+                                              len(self.seeds))])
+                    self.curr_index = len(self.seeds)
+                else:
+                    new_streamlines = ray.get([func.remote(i)
+                                              for i in range(self.curr_index,
+                                              self.curr_index +
+                                              self.buffer_size)])
+                    self.curr_index += self.buffer_size
+                self._streamlines.extend(new_streamlines)
+            # yield next from buffer
+            yield self._streamlines.pop(0)
+
+    def _generate_streamline(self, index):
+        """Returns a Streamline from the given index of a seed"""
+
+        # Get inverse transform (lin/offset) for seeds
+        inv_A = np.linalg.inv(self.affine)
+        lin = inv_A[:3, :3]
+        offset = inv_A[:3, 3]
+
+        F = np.empty((self.max_length + 1, 3), dtype=float)
+        B = F.copy()
+
+        s = self.seeds[index]
+
+        s = np.dot(lin, s) + offset
+        # Set the random seed in numpy, random and fast_numpy (lic.stdlib)
+        if self.random_seed is not None:
+            s_random_seed = hash(np.abs((np.sum(s)) + self.random_seed)) \
+                % (np.iinfo(np.uint32).max - 1)
+            random.seed(s_random_seed)
+            np.random.seed(s_random_seed)
+            fast_numpy.seed(s_random_seed)
+
+        if self.initial_directions is None:
+            directions = self.direction_getter.initial_direction(s)
+        else:
+            # normalize the initial directions.
+            # initial directions with norm 0 are removed.
+            d_ns = np.linalg.norm(self.initial_directions[index, :, :],
+                                  axis=1)
+            directions = self.initial_directions[index, d_ns > 0, :] \
+                / d_ns[d_ns > 0, np.newaxis]
+
+        if len(directions) == 0 and self.return_all:
+            # only the seed position
+            if self.save_seeds:
+                return [s], s
+            else:
+                return [s]
+
+        if self.randomize_forward_direction:
+            directions = [d * random.choice([1, -1]) for d in directions]
+
+        directions = directions[:self.max_cross]
+
+        for first_step in directions:
+            stepsF = stepsB = 1
+            stepsF, stream_status = self._tracker(s, first_step, F)
+            if not (self.return_all
+                    or stream_status in (StreamlineStatus.ENDPOINT,
+                                            StreamlineStatus.OUTSIDEIMAGE)):
+                continue
+
+            if not self.unidirectional:
+                first_step = -first_step
+                if stepsF > 1:
+                    # Use the opposite of the first selected orientation for
+                    # the backward tracking segment
+                    opposite_step = F[0] - F[1]
+                    opposite_step_norm = np.linalg.norm(opposite_step)
+                    if opposite_step_norm > 0:
+                        first_step = opposite_step / opposite_step_norm
+                stepsB, stream_status = self._tracker(s, first_step, B)
+                if not (self.return_all or
+                        stream_status in (StreamlineStatus.ENDPOINT,
+                                            StreamlineStatus.OUTSIDEIMAGE)):
+                    continue
+
+            if stepsB == 1:
+                streamline = F[:stepsF].copy()
+            else:
+                parts = (B[stepsB - 1:0:-1], F[:stepsF])
+                streamline = np.concatenate(parts, axis=0)
+
+            # move to the next streamline if only the seed position
+            # and not return all
+            len_sl = len(streamline)
+            if len_sl >= self.min_length and len_sl <= self.max_length \
+                or self.return_all:
+                    if self.save_seeds:
+                        return streamline, s
+                    else:
+                        return streamline
+
+
 class ParticleFilteringTracking(LocalTracking):
 
     def __init__(self, direction_getter, stopping_criterion, seeds, affine,
@@ -384,3 +564,4 @@ class ParticleFilteringTracking(LocalTracking):
                            self.particle_steps,
                            self.particle_stream_statuses,
                            self.min_wm_pve_before_stopping)
+
